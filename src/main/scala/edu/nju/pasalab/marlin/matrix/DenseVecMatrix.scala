@@ -15,13 +15,10 @@ import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
 import org.apache.hadoop.io.{Text, NullWritable}
 import org.apache.hadoop.mapred.TextOutputFormat
-
+import scala.util.control.Breaks._
 import edu.nju.pasalab.marlin.utils.MTUtils
 
-/**
- * This class overrides from [[org.apache.spark.mllib.linalg.distributed.IndexedRowMatrix]]
- * Notice: some code in this file is copy from MLlib to make it compatible
- */
+
 class DenseVecMatrix(
     val rows: RDD[(Long, DenseVector)],
     private var nRows: Long,
@@ -167,8 +164,8 @@ class DenseVecMatrix(
 
     resultCols = other.numCols()
 
-    val thisBlocks = toBlockMatrix(blkNum, blkNum)
-    val otherBlocks = other.toBlockMatrix(blkNum, blkNum)
+    val thisBlocks = asInstanceOf[DenseVecMatrix].toBlockMatrix(blkNum, blkNum)
+    val otherBlocks = other.asInstanceOf[DenseVecMatrix].toBlockMatrix(blkNum, blkNum)
     thisBlocks.multiply(otherBlocks, blkNum * blkNum * blkNum)
   }
 
@@ -186,8 +183,8 @@ class DenseVecMatrix(
     require(numCols == otherRows, s"Dimension mismatch: ${numCols} vs ${otherRows}")
     val (mSplitNum, kSplitNum, nSplitNum) =
       MTUtils.splitMethod(numRows(), numCols(), other.numCols(), cores)
-    val thisCollects = toBlockMatrix(mSplitNum, kSplitNum)
-    val otherCollects = other.toBlockMatrix(kSplitNum, nSplitNum)
+    val thisCollects = asInstanceOf[DenseVecMatrix].toBlockMatrix(mSplitNum, kSplitNum)
+    val otherCollects = other.asInstanceOf[DenseVecMatrix].toBlockMatrix(kSplitNum, nSplitNum)
     thisCollects.multiply(otherCollects, cores)
   }
 
@@ -206,8 +203,8 @@ class DenseVecMatrix(
                               splits:(Int, Int, Int), mode: String): BlockMatrix = {
     val otherRows = other.numRows()
     require(numCols == otherRows, s"Dimension mismatch: ${numCols} vs ${otherRows}")
-    val thisCollects = toBlockMatrix(splits._1, splits._2)
-    val otherCollects = other.toBlockMatrix(splits._2, splits._3)
+    val thisCollects = asInstanceOf[DenseVecMatrix].toBlockMatrix(splits._1, splits._2)
+    val otherCollects = other.asInstanceOf[DenseVecMatrix].toBlockMatrix(splits._2, splits._3)
     thisCollects.multiplyBroadcast(otherCollects, parallelism, splits, mode)
   }
 
@@ -278,7 +275,7 @@ class DenseVecMatrix(
           }else t
         }}, true)
       lowerMat = new DenseVecMatrix(lresult, numRows(), numCols())
-      //cache the lower matrix to speed the compution
+      //cache the lower matrix to speed the computation
       val result = matr.rows.mapPartitions(iter =>{
         iter.map(t => {
           if ( t._1.toInt > i){
@@ -293,7 +290,7 @@ class DenseVecMatrix(
           else t
         })}, true)
       matr = new DenseVecMatrix(result, numRows(), numCols())
-      //cache the matrix to speed the compution
+      //cache the matrix to speed the computation
       matr.rows.cache()
       if (i % 2000 == 0){
         if (matr.rows.context.getCheckpointDir.isDefined)
@@ -303,6 +300,95 @@ class DenseVecMatrix(
     (lowerMat, matr)
   }
 
+  /**
+   * This function is still in progress.
+   * get the inverse of this DenseVecMatrix
+   *
+   * @return the inverse of the square matrix, zero matrix if the DenseVecMatrix is singular
+   */
+  def inverse(mode: String = "auto"): DenseVecMatrix = {
+    val iterations = numRows()
+    require(iterations == numCols(),
+      s"currently we only support square matrix: ${iterations} vs ${numCols}")
+
+    var matr = new DenseVecMatrix(rows.map( t => {
+      val array = Array.ofDim[Double](numCols().toInt)
+      val v = t._2.toArray
+      for ( k <- 0 until v.length){
+        array(k) = v.apply(k)
+      }
+      (t._1, Vectors.dense(array))}))
+
+    val num = iterations.toInt
+
+    breakable {for (i <- 0 until num) {  
+     val updateVec = matr.rows.map(t => (t._1, t._2.toArray.apply(i))).collect()
+     val ideal = updateVec.maxBy(t => t._2.abs)
+     var candidate = 1.0 / ideal._2 
+     if ((1.0 / ideal._2).isInfinite() || (1.0 / ideal._2).isNaN) {
+       // singular　matrix, exit
+        val result = matr.rows.mapPartitions( iter => {
+        iter.map { t =>
+          (t._1, Vectors.dense(Array.fill[Double](num)(0)))
+          }})  
+        matr = new DenseVecMatrix(result, numRows(), numCols())
+        break      
+     }
+     else if ((1.0 / updateVec.apply(i)._2).isInfinite() || (1.0 / updateVec.apply(i)._2).isNaN){
+       //need to swap the rows with row number ideal_.1 and i
+       val currentRow = matr.rows.filter(t => t._1.toInt == i).first()
+       val idealRow = matr.rows.filter(t => t._1 == ideal._1).first()
+       val result = matr.rows.map( t => 
+         if (t._1.toInt == i)
+           idealRow
+         else if (t._1.toInt == ideal._1)
+           currentRow
+         else 
+           t)
+        matr = new DenseVecMatrix(result, numRows(), numCols())     
+     }
+     val vector = matr.rows.filter(t => t._1.toInt == i).map(t => t._2).first().toArray
+     val c = matr.rows.context.broadcast(vector.apply(i))
+     
+   //  vector.foreach(t => (t/c.value))
+     for (i <- 0 until vector.length)
+       vector.update(i, vector(i)/c.value)
+     val broadRow = matr.rows.context.broadcast(vector)
+     
+
+      //TODO: here collect() is too much cost, find another method
+      val broadCol = matr.rows.context.broadcast(updateVec.map(t => t._2))
+      
+      val result = matr.rows.mapPartitions( iter => {
+        iter.map { t =>
+          val vec = t._2.toArray;
+          if (t._1.toInt == i){
+            for (k <- 0 until vec.length)              
+              if (k == i) {
+                vec.update(k, broadRow.value.apply(k) / c.value)
+              }
+              else {vec.update(k, broadRow.value.apply(k))
+              }              
+          }
+          else {
+            for (k <- 0 until vec.length if k != i) {
+              vec.update(k, vec(k) - broadCol.value.apply(t._1.toInt) * broadRow.value.apply(k))    
+            }           
+          }
+          if (t._1.toInt != i)
+            vec.update(i, vec(i) / (-c.value))
+          (t._1, Vectors.dense(vec))
+          }}, true)        
+       matr = new DenseVecMatrix(result, numRows(), numCols())
+      //cache the matrix to speed the computation
+      matr.rows.cache()
+      /*
+      if (i % 2000 == 0)
+        matr.rows.checkpoint()
+        * */
+    }} 
+    matr
+  }
 
   /**
    * This matrix add another DistributedMatrix
@@ -315,8 +401,10 @@ class DenseVecMatrix(
         require(numRows() == that.numRows(), s"Dimension mismatch: ${numRows()} vs ${that.numRows()}")
         require(numCols() == that.numCols, s"Dimension mismatch: ${numCols()} vs ${that.numCols()}")
 
-        val result = rows.join(that.rows).map(t =>
-          (t._1, Vectors.fromBreeze((t._2._1.toBreeze + t._2._2.toBreeze).asInstanceOf[BDV[Double]])))
+        val result = rows.join(that.rows).mapPartitions(iter => {
+          iter.map (t =>
+            (t._1, Vectors.fromBreeze((t._2._1.toBreeze + t._2._2.toBreeze).asInstanceOf[BDV[Double]])))
+        }, true)
         new DenseVecMatrix(result, numRows(), numCols())
       }
       case that: BlockMatrix => {
@@ -340,8 +428,10 @@ class DenseVecMatrix(
         require(numRows() == that.numRows(), s"Dimension mismatch: ${numRows()} vs ${other.numRows()}")
         require(numCols == that.numCols, s"Dimension mismatch: ${numCols()} vs ${other.numCols()}")
 
-        val result = rows.join(that.rows).map(t =>
-          (t._1, Vectors.fromBreeze((t._2._1.toBreeze - t._2._2.toBreeze).asInstanceOf[BDV[Double]])))
+        val result = rows.join(that.rows).mapPartitions(iter => {
+          iter.map(t =>
+            (t._1, Vectors.dense(t._2._1.toArray.zip(t._2._2.toArray).map(x => x._1 - x._2))))
+        }, true)
         new DenseVecMatrix(result, numRows(), numCols())
       }
       case that: BlockMatrix => {
@@ -358,7 +448,7 @@ class DenseVecMatrix(
    * @param b the number to be element-wise added
    */
   final def add(b: Double): DenseVecMatrix = {
-    val result = rows.map(t =>(t._1, Vectors.dense(t._2.toArray.map(_ + b))))
+    val result = rows.mapPartitions(iter => {iter.map(t =>(t._1, Vectors.dense(t._2.toArray.map(_ + b))))}, true)
     new DenseVecMatrix(result, numRows(), numCols())
   }
 
@@ -368,7 +458,7 @@ class DenseVecMatrix(
    * @param b a number to be element-wise subtracted
    */
   final def subtract(b: Double): DenseVecMatrix = {
-    val result = rows.map(t =>(t._1, Vectors.dense(t._2.toArray.map(_ - b))))
+    val result = rows.mapPartitions(iter => {iter.map(t =>(t._1, Vectors.dense(t._2.toArray.map(_ - b))))}, true)
     new DenseVecMatrix(result, numRows(), numCols())
   }
 
@@ -378,7 +468,7 @@ class DenseVecMatrix(
    * @param b a number in the format of double
    */
   final def subtractBy(b: Double): DenseVecMatrix = {
-    val result = rows.map(t =>(t._1, Vectors.dense(t._2.toArray.map(b - _ ))))
+    val result = rows.mapPartitions(iter => {iter.map(t =>(t._1, Vectors.dense(t._2.toArray.map(b - _ ))))}, true)
     new DenseVecMatrix(result, numRows(), numCols())
   }
 
@@ -388,7 +478,7 @@ class DenseVecMatrix(
    * @param b a number in the format of double
    */
   final def multiply(b: Double): DenseVecMatrix = {
-    val result = rows.map(t =>(t._1, Vectors.dense(t._2.toArray.map(_ * b))))
+    val result = rows.mapPartitions(iter => {iter.map(t =>(t._1, Vectors.dense(t._2.toArray.map(_ * b))))}, true)
     new DenseVecMatrix(result, numRows(), numCols())
   }
 
@@ -399,7 +489,7 @@ class DenseVecMatrix(
    * @return result in DenseVecMatrix type
    */
   final def divide(b: Double): DenseVecMatrix = {
-    val result = rows.map(t =>(t._1, Vectors.dense(t._2.toArray.map( _ / b))))
+    val result = rows.mapPartitions(iter => {iter.map(t =>(t._1, Vectors.dense(t._2.toArray.map( _ / b))))}, true)
     new DenseVecMatrix(result, numRows(), numCols())
   }
 
@@ -409,8 +499,41 @@ class DenseVecMatrix(
    * @param b a number in the format of double
    */
   final def divideBy(b: Double): DenseVecMatrix = {
-    val result = rows.map(t =>(t._1, Vectors.dense(t._2.toArray.map( b / _))))
+    val result = rows.mapPartitions(iter => {iter.map (t =>(t._1, Vectors.dense(t._2.toArray.map( b / _))))}, true)
     new DenseVecMatrix(result, numRows(), numCols())
+  }
+
+  /**
+   * Sum all the elements in matrix ,note the Double.MaxValue is 1.7976931348623157E308
+   *
+   */
+  def sum(): Double = {
+    rows.mapPartitions(iter =>
+      iter.map(t => t._2.toArray.sum), true).reduce(_ + _)
+  }
+
+  /**
+   * Matrix-matrix dot product, the two input matrices must have the same row and column dimension
+   * @param other the matrix to be dot product
+   * @return
+   */
+  def dotProduct(other: DistributedMatrix): DistributedMatrix = {
+    require(numRows() == other.numRows(), s"row dimension mismatch ${numRows()} vs ${other.numRows()}")
+    require(numCols() == other.numCols(), s"column dimension mismatch ${numCols()} vs ${other.numCols()}")
+    other match {
+      case that: DenseVecMatrix => {
+        val result = rows.join(that.rows).mapPartitions(iter => {
+          iter.map(t => {
+            val array = t._2._1.toArray.zip(t._2._2.toArray).map(x => x._1 * x._2)
+            (t._1, Vectors.dense(array))
+          })
+        }, true)
+        new DenseVecMatrix(result, numRows(), numCols())
+      }
+      case that: BlockMatrix => {
+        dotProduct(that.toDenseVecMatrix())
+      }
+    }
   }
 
   /**
@@ -556,7 +679,7 @@ class DenseVecMatrix(
      val result = rows.mapPartitions(iter => {
         iter.map( t => {
           (t._1.toInt / mBlockRowSize, t)})
-      }, true).groupByKey().mapPartitions(iter => {
+      }).groupByKey().mapPartitions(iter => {
         iter.map(t => {
           val blockRow = t._1
           val rowLen = if ((blockRow + 1) * mBlockRowSize > numRows()){
@@ -676,15 +799,22 @@ class DenseVecMatrix(
   }
 
   /**
-   * print the matrix out
+   * Print the matrix out
    */
   def print() {
     if (numRows() > 20){
       rows.take(20).foreach( t => println("index: "+t._1 + ", vector: "+ t._2.print(8)))
-      println((numRows() - 20)+ "rows more...")
+      println("there are " + numRows()+ " rows total...")
     }else {
       rows.collect().foreach(t => println("index: "+t._1 + ", vector: "+ t._2.print(8)))
     }
+  }
+
+  /**
+   * Print the whole matrix out
+   */
+  def printAll() {
+    rows.collect().foreach(t => println("index: "+t._1 + ", vector: "+ t._2.print()))
   }
 
   /**

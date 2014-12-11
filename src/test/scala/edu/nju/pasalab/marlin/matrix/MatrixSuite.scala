@@ -13,9 +13,9 @@ class MatrixSuite extends FunSuite with LocalSparkContext{
   val c = 2
   val data = Seq(
     (0L, Vectors.dense(0.0, 1.0, 2.0, 3.0)),
-    (1L, Vectors.dense(2.0, 3.0, 4.0, 5.0)),
     (2L, Vectors.dense(3.0, 2.0, 1.0, 0.0)),
-    (3L, Vectors.dense(1.0, 1.0, 1.0, 1.0))
+    (3L, Vectors.dense(1.0, 1.0, 1.0, 1.0)),
+    (1L, Vectors.dense(2.0, 3.0, 4.0, 5.0))
   ).map(t => (t._1, t._2))
   val blks = Seq(
     (new BlockID(0, 0), BDM((0.0, 1.0), (2.0, 3.0))),
@@ -31,7 +31,6 @@ class MatrixSuite extends FunSuite with LocalSparkContext{
     indexRows = sc.parallelize(data, 2)
     blocks = sc.parallelize(blks, 2)
   }
-
 
 
   test("matrix size"){
@@ -100,12 +99,6 @@ class MatrixSuite extends FunSuite with LocalSparkContext{
     assert(rowSeq.contains((1L, Vectors.dense(2.0, 3.0, 4.0, 5.0))))
     assert(rowSeq.contains((2L, Vectors.dense(3.0, 2.0, 1.0, 0.0))))
     assert(rowSeq.contains((3L, Vectors.dense(1.0, 1.0, 1.0, 1.0))))
-    /*
-    assert(blkSeq.contains(new BlockID(0, 0), BDM((0.0, 1.0),(2.0, 3.0))))
-    assert(blkSeq.contains(new BlockID(0, 1), BDM((2.0, 3.0),(4.0, 5.0))))
-    assert(blkSeq.contains(new BlockID(1, 0), BDM((3.0, 2.0),(1.0, 1.0))))
-    assert(blkSeq.contains(new BlockID(1, 1), BDM((1.0, 0.0),(1.0, 1.0))))
-    */
   }
 
   test("Matrix-matrix and element-wise addition/subtract; element-wise multiply and divide"){
@@ -259,7 +252,41 @@ class MatrixSuite extends FunSuite with LocalSparkContext{
       (7.0, 8.0, 0.0))
    assert(result === self)
   }
+  
+  
 
+  test("sum"){
+    val mat = new DenseVecMatrix(indexRows)
+    val blkMat = new BlockMatrix(blocks)
+    assert(mat.sum() === 30.0)
+    assert(blkMat.sum() === 30.0)
+  }
 
+  test("dot product"){
+    val mat = new DenseVecMatrix(indexRows)
+    val blkMat = new BlockMatrix(blocks)
+    val dotProduct = BDM(
+      (0.0, 1.0, 4.0, 9.0),
+      (4.0, 9.0, 16.0, 25.0),
+      (9.0, 4.0, 1.0, 0.0),
+      (1.0, 1.0, 1.0, 1.0))
+    assert(mat.dotProduct(mat).toBreeze() === dotProduct)
+    assert(mat.dotProduct(blkMat).toBreeze() === dotProduct)
+    assert(blkMat.dotProduct(mat).toBreeze() === dotProduct)
+    assert(blkMat.dotProduct(blkMat).toBreeze() === dotProduct)
+  }
 
+   test("DenseVecMatrix inverse") {
+    val row = Seq(
+      (0L, Vectors.dense(4.0, 3.0)),
+      (1L, Vectors.dense(3.0, 2.0))   
+    ).map(t => (t._1, t._2))
+    val mat = new DenseVecMatrix(sc.parallelize(row,2))
+    val inverse = mat.inverse()
+    val identity = BDM(
+      (-2.0, 3.0),
+      (3.0, -4.0))
+    assert(inverse.toBreeze() === identity)
+   }
+ 
 }

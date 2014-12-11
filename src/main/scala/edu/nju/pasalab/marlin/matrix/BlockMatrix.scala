@@ -93,7 +93,6 @@ class BlockMatrix(
     require(numCols() == other.numRows(), s"Dimension mismatch: ${numCols()} vs ${other.numRows()}")
     other match {
       case mat: BlockMatrix => {
-
         if (numBlksByCol() != mat.numBlksByRow()) {
           toDenseVecMatrix().multiply(mat.toDenseVecMatrix(), cores)
         } else {
@@ -313,14 +312,54 @@ class BlockMatrix(
   }
 
   /**
+   * Sum all the elements in matrix ,note the Double.MaxValue is 1.7976931348623157E308
+   *
+   */
+  def sum(): Double = {
+    blocks.mapPartitions(iter => {
+      iter.map(t => t._2.data.sum)
+    }, true).reduce(_ + _)
+  }
+
+  /**
+   * Matrix-matrix dot product, the two input matrices must have the same row and column dimension
+   * @param other the matrix to be dot product
+   * @return
+   */
+  def dotProduct(other: DistributedMatrix): DistributedMatrix = {
+    require(numRows() == other.numRows(), s"row dimension mismatch ${numRows()} vs ${other.numRows()}")
+    require(numCols() == other.numCols(), s"column dimension mismatch ${numCols()} vs ${other.numCols()}")
+    other match{
+      case that: DenseVecMatrix => {
+        toDenseVecMatrix().dotProduct(that)
+      }
+      case that: BlockMatrix => {
+        if (numBlksByRow() == that.numBlksByRow() && numBlksByCol() == that.numBlksByCol()){
+          val result = blocks.join(that.blocks).mapValues(t =>{
+            val rows = t._1.rows
+            val cols = t._1.cols
+            val array = t._1.data.zip(t._2.data)
+              .map(x => x._1 * x._2).toArray
+            new BDM(rows, cols, array)
+          })
+          new BlockMatrix(result, numRows(), numCols(), numBlksByRow(), numBlksByCol())
+        }else {
+          toDenseVecMatrix().dotProduct(toDenseVecMatrix())
+        }
+      }
+    }
+  }
+
+  /**
    *  A transposed view of BlockMatrix
    *
    *  @return the transpose of this BlockMatrix
    */
   final def transpose(): BlockMatrix = {
     val result = blocks.mapPartitions( iter =>{
-      iter.map ( t =>{
-        (new BlockID(t._1.column, t._1.row), t._2.t )
+      iter.map ( x =>{
+        val mat: BDM[Double] = x._2.t.copy
+        (new BlockID(x._1.column, x._1.row), mat )
       })
     })
     new BlockMatrix(result, numCols(), numRows(), numBlksByCol(), numBlksByRow())
@@ -425,7 +464,7 @@ class BlockMatrix(
   def toDenseVecMatrix(): DenseVecMatrix = {
     val mostBlockRowLen = math.ceil( numRows().toDouble / numBlksByRow().toDouble).toInt
     val mostBlockColLen = math.ceil( numCols().toDouble / numBlksByCol().toDouble).toInt
-    //    blocks.cache()
+    // blocks.cache()
     val result = blocks.flatMap( t => {
       val smRows = t._2.rows
       val smCols = t._2.cols
@@ -482,17 +521,25 @@ class BlockMatrix(
   }
 
   /**
-   * print the matrix out
+   * Print the matrix out
    */
   def print() {
     if  (numBlksByRow() * numBlksByCol() > 4){
       blocks.take(4).foreach(t => println("blockID :[" + t._1.row + ", " + t._1.column
         + "], block content below:\n" + t._2.toString()))
-      println("there are " + (numBlksByRow() * numBlksByCol() - 4) + " blocks more")
+      println("there are " + (numBlksByRow() * numBlksByCol()) + " blocks total...")
     }else {
       blocks.collect().foreach(t => println("blockID :[" + t._1.row + ", " + t._1.column
         + "], block content below:\n"+ t._2.toString()))
     }
+  }
+
+  /**
+   * Print the whole matrix out
+   */
+  def printAll() {
+    blocks.collect().foreach(t => println("blockID :[" + t._1.row + ", " + t._1.column
+      + "], block content below:\n"+ t._2.toString()))
   }
 
 }
